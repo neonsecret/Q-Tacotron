@@ -1,8 +1,18 @@
+from transformers import AutoModel
+
 from config import ConfigArgs as args
 import torch
 import torch.nn as nn
 from network import TextEncoder, ReferenceEncoder, StyleTokenLayer, AudioDecoder, AttentionLayer
 import module as mm
+
+
+class Empty:
+    def __init__(self):
+        pass
+
+    def __call__(self, x):
+        return x
 
 
 class QTacotron(nn.Module):
@@ -21,9 +31,8 @@ class QTacotron(nn.Module):
         self.decoder = AudioDecoder(enc_dim=args.Cx * 3, dec_dim=args.Cx)
         self.attention = AttentionLayer(embed_size=args.Cx, n_units=args.Cx)
 
-        self.Bert = None
-        self.WordLabelsPredictor = None
-        self.ReplicateWordLevelPredictors = None
+        self.Bert = AutoModel.from_pretrained("DeepPavlov/rubert-base-cased").eval()
+        self.WordLabelsPredictor = Empty()  # find later
 
     def forward(self, texts, prev_mels, refs=None, synth=False, ref_mode=True):
         """
@@ -45,7 +54,7 @@ class QTacotron(nn.Module):
         text_emb, enc_hidden = self.encoder(x)  # (N, Tx, Cx*2)
         tp_style_emb = self.tpnet(text_emb)
         bert_embeds = self.Bert(texts)
-        replicated_embeds = self.ReplicateWordLevelPredictors(self.WordLabelsPredictor(bert_embeds, text_emb))
+        replicated_embeds = self.WordLabelsPredictor(bert_embeds + text_emb)
         if synth:
             style_emb, style_attentions = tp_style_emb + bert_embeds + replicated_embeds, None
         else:

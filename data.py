@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data.dataset import Dataset
+from transformers import AutoTokenizer
 
 import utils
 from config import ConfigArgs as args
@@ -27,6 +28,7 @@ class SpeechDataset(Dataset):
     def __init__(self, data_path, metadata, mem_mode=False, training=True, training_ratio=0.99):
         self.data_path = data_path
         self.mem_mode = mem_mode
+        self.tokenizer = AutoTokenizer.from_pretrained("DeepPavlov/rubert-base-cased")
         meta = read_meta(os.path.join(data_path, metadata))
         n_rows = len(meta)
         np.random.seed(0)
@@ -34,10 +36,9 @@ class SpeechDataset(Dataset):
 
         meta = meta[~meta.index.isin(train_indices)] if not training else meta[meta.index.isin(train_indices)]
         self.fpaths, self.texts = [], []
-        ch2idx, _ = load_vocab()
         meta.expanded = 'P' + meta.expanded + 'E'
         for fpath, text in zip(meta.fpath.values, meta.expanded.values):
-            t = np.array([ch2idx[ch] for ch in jamo.h2j(text)])
+            t = np.array(self.tokenizer.encode(text))
             f = os.path.join(data_path, args.mel_dir, os.path.basename(fpath).replace('wav', 'npy'))
             self.texts.append(t)
             self.fpaths.append(f)
@@ -46,7 +47,6 @@ class SpeechDataset(Dataset):
                 self.data_path, args.mel_dir, path))) for path in self.fpaths]
 
     def __getitem__(self, idx):
-        text, mel = None, None
         text = torch.tensor(self.texts[idx], dtype=torch.long)
         # Memory mode is faster
         if not self.mem_mode:
@@ -60,20 +60,6 @@ class SpeechDataset(Dataset):
         return len(self.fpaths)
 
 
-def load_vocab():
-    """
-    Makes dictionaries
-
-    Returns:
-        :char2idx: Dictionary containing characters as keys and corresponding indexes as values
-        :idx2char: Dictionary containing indexes as keys and corresponding characters as values
-
-    """
-    char2idx = {char: idx for idx, char in enumerate(args.vocab)}
-    idx2char = {idx: char for idx, char in enumerate(args.vocab)}
-    return char2idx, idx2char
-
-
 def text_normalize(text):
     """
     Normalizes text
@@ -84,11 +70,7 @@ def text_normalize(text):
         text: Normalized text
     
     """
-    text = ''.join(char for char in unicodedata.normalize('NFD', text)
-                   if unicodedata.category(char) != 'Mn')  # Strip accents
-    text = text.lower()
-    text = re.sub(u"[^{}]".format(args.vocab), " ", text)
-    text = re.sub("[ ]+", " ", text)
+    text = text.replace("\n", "")
     return text
 
 
@@ -138,13 +120,14 @@ class TextDataset(Dataset):
     """
     Text Dataset for synthesis
 
-    :param text path: String. path to text dataset
+    :param text text_path: String. path to text dataset
     :param ref_path: String. {<ref_path>, 'seen', 'unseen'}
 
     """
 
     def __init__(self, text_path, ref_path=None):
-        self.texts = read_hangul(text_path)
+        self.tokenizer = AutoTokenizer.from_pretrained("DeepPavlov/rubert-base-cased")
+        self.texts = read_text(text_path, self.tokenizer)
 
     def __getitem__(self, idx):
         text = torch.tensor(self.texts[idx], dtype=torch.long)
@@ -154,7 +137,7 @@ class TextDataset(Dataset):
         return len(self.texts)
 
 
-def read_text(path):
+def read_text(path, tokenizer):
     """
     If we use pandas instead of this function, it may not cover quotes.
 
@@ -164,33 +147,12 @@ def read_text(path):
         texts: list of normalized texts
 
     """
-    char2idx, _ = load_vocab()
     lines = codecs.open(path, 'r', 'utf-8').readlines()[1:]
     texts = []
     for line in lines:
         text = text_normalize(line.split(' ', 1)[-1]).strip() + u'E'  # ␃: EOS
-        text = [char2idx[char] for char in text]
+        text = tokenizer.encode(text)
         texts.append(text)
-    return texts
-
-
-def read_hangul(path):
-    """
-    If we use pandas instead of this function, it may not cover quotes.
-
-    :param path: String. metadata path
-
-    Returns:
-        texts: list of normalized texts
-
-    """
-    ch2idx, _ = load_vocab()
-    lines = codecs.open(path, 'r', 'utf-8').readlines()
-    texts = []
-    for line in lines:
-        hangul = 'P' + jamo.h2j(text_normalize(line).strip()) + 'E'
-        t = np.array([ch2idx[ch] for ch in hangul])
-        texts.append(t)
     return texts
 
 
