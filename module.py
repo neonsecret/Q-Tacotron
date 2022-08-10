@@ -1,7 +1,7 @@
-from config import ConfigArgs as args
 import torch
 import torch.nn as nn
-import numpy as np
+
+from config import ConfigArgs as args
 
 
 class Conv2d(nn.Conv2d):

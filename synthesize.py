@@ -11,13 +11,14 @@ from tqdm import tqdm, trange
 
 import numpy as np
 import pandas as pd
-from model import TPGST
+from model import QTacotron
 from data import TextDataset, text_collate_fn, load_vocab, SpeechDataset, collate_fn
 import utils
 import glob
 from scipy.io.wavfile import write
 
 DEVICE = None
+
 
 def synthesize(model, data_loader, batch_size=100):
     """
@@ -30,21 +31,23 @@ def synthesize(model, data_loader, batch_size=100):
     """
     idx2char = load_vocab()[-1]
     with torch.no_grad():
-        print('*'*15, ' Synthesize ', '*'*15)
+        print('*' * 15, ' Synthesize ', '*' * 15)
         for step, (texts, _, _) in enumerate(data_loader):
             texts = texts.to(DEVICE)
-            GO_frames = torch.zeros([texts.shape[0], 1, args.n_mels*args.r]).to(DEVICE)            
+            GO_frames = torch.zeros([texts.shape[0], 1, args.n_mels * args.r]).to(DEVICE)
             mels_hat, mags_hat, A, _, _, se, _ = model(texts, GO_frames, synth=True)
             mels_hat = mels_hat.cpu().numpy()
             # alignments = A.cpu().detach().numpy()
             # visual_texts = texts.cpu().detach().numpy()
-            mags = mags_hat.cpu().detach().numpy() # mag: (N, Ty, n_mags)
-            print('='*10, ' Vocoder ', '='*10)
+            mags = mags_hat.cpu().detach().numpy()  # mag: (N, Ty, n_mags)
+            print('=' * 10, ' Vocoder ', '=' * 10)
             for idx in range(len(texts)):
-                np.save(os.path.join(args.sampledir, 'mel-{:04d}.npy'.format(idx+step*batch_size+1)), mels_hat[idx])
+                np.save(os.path.join(args.sampledir, 'mel-{:04d}.npy'.format(idx + step * batch_size + 1)),
+                        mels_hat[idx])
                 # text = [idx2char[ch] for ch in visual_texts[idx]]
                 # utils.plot_att(alignments[idx], text, args.global_step, path=os.path.join(args.sampledir, 'A'), name='{:03d}.png'.format(idx+step*batch_size+1))
     return None
+
 
 def main(load_model='latest'):
     """
@@ -56,12 +59,12 @@ def main(load_model='latest'):
     """
     assert os.path.exists(args.testset), 'Test sentence path is wrong.'
 
-    model = TPGST().to(DEVICE)
+    model = QTacotron().to(DEVICE)
 
     testset = TextDataset(args.testset, args.ref_path)
     test_loader = DataLoader(dataset=testset, batch_size=args.test_batch, drop_last=False,
-                            shuffle=False, collate_fn=text_collate_fn, pin_memory=True)
-    
+                             shuffle=False, collate_fn=text_collate_fn, pin_memory=True)
+
     if load_model.lower() == 'best':
         ckpt = pd.read_csv(os.path.join(args.logdir, model.name, 'ckpt.csv'), sep=',', header=None)
         ckpt.columns = ['models', 'loss']
@@ -70,7 +73,7 @@ def main(load_model='latest'):
     elif 'pth.tar' in load_model:
         model_path = load_model
     else:
-        model_path = sorted(glob.glob(os.path.join(args.logdir, model.name, 'model-*.tar')))[-1] # latest model
+        model_path = sorted(glob.glob(os.path.join(args.logdir, model.name, 'model-*.tar')))[-1]  # latest model
     state = torch.load(model_path)
     model.load_state_dict(state['model'])
     args.global_step = state['global_step']
@@ -78,7 +81,7 @@ def main(load_model='latest'):
     print('The model is loaded. Step: {}'.format(args.global_step))
 
     model.eval()
-    
+
     if not os.path.exists(os.path.join(args.sampledir, 'A')):
         os.makedirs(os.path.join(args.sampledir, 'A'))
 
@@ -90,6 +93,7 @@ def main(load_model='latest'):
         tp_synthesize(model, test_loader, args.test_batch)
     elif synth_mode == 'fix':
         fixed_synthesize(model, test_loader, args.test_batch)
+
 
 if __name__ == '__main__':
     gpu_id = int(sys.argv[1])

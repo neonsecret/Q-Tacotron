@@ -6,8 +6,10 @@ from scipy import signal
 import copy
 import torch
 import matplotlib
+
 matplotlib.use('pdf')
 import matplotlib.pyplot as plt
+
 
 def load_spectrogram(fpath):
     """
@@ -53,6 +55,7 @@ def load_spectrogram(fpath):
     mel, mag = padding_reduction(mel, mag)
     return mel, mag
 
+
 def padding_reduction(mel, mag):
     """
     Pads for reduction factor
@@ -68,10 +71,11 @@ def padding_reduction(mel, mag):
     # Padding
     t = mel.shape[0]
     n_paddings = args.r - (t % args.r) if t % args.r != 0 else 0  # for reduction
-    mel = np.reshape(np.pad(mel, [[0, n_paddings], [0, 0]], mode="constant"), [-1, args.n_mels*args.r])
+    mel = np.reshape(np.pad(mel, [[0, n_paddings], [0, 0]], mode="constant"), [-1, args.n_mels * args.r])
     mag = np.pad(mag, [[0, n_paddings], [0, 0]], mode="constant")
     # mel = mel[::args.r, :] # DCTTS
     return mel, mag
+
 
 def att2img(A):
     """
@@ -86,7 +90,7 @@ def att2img(A):
     for i in range(A.shape[-1]):
         att = A[0, :, i]
         local_min, local_max = att.min(), att.max()
-        A[0, :, i] = (att-local_min)/(local_max-local_min)
+        A[0, :, i] = (att - local_min) / (local_max - local_min)
     return A
 
 
@@ -114,6 +118,7 @@ def plot_att(A, text, global_step, path='.', name=None):
         plt.savefig(os.path.join(path, 'A-{}.png'.format(global_step)), format='png')
     plt.close(fig)
 
+
 def lr_policy(step):
     """
     warm up learning rate function
@@ -123,4 +128,4 @@ def lr_policy(step):
     Returns:
         :updated learning rate: scalar.
     """
-    return args.warm_up_steps**0.5 * np.minimum((step+1) * args.warm_up_steps**-1.5, (step+1)**-0.5)
+    return args.warm_up_steps ** 0.5 * np.minimum((step + 1) * args.warm_up_steps ** -1.5, (step + 1) ** -0.5)

@@ -1,13 +1,18 @@
+import codecs
+import glob
+import os
+import re
+import unicodedata
+
+import jamo
 import numpy as np
 import pandas as pd
-import os, sys
 import torch
 from torch.utils.data.dataset import Dataset
-import glob, re
+
 import utils
-import codecs, unicodedata
 from config import ConfigArgs as args
-import jamo
+
 
 class SpeechDataset(Dataset):
     """
@@ -18,14 +23,15 @@ class SpeechDataset(Dataset):
     :param mem_mode: Boolean. whether loads into memory
 
     """
+
     def __init__(self, data_path, metadata, mem_mode=False, training=True, training_ratio=0.99):
         self.data_path = data_path
         self.mem_mode = mem_mode
         meta = read_meta(os.path.join(data_path, metadata))
         n_rows = len(meta)
         np.random.seed(0)
-        train_indices = np.random.choice(range(n_rows), int(n_rows*training_ratio), replace=False)
-        
+        train_indices = np.random.choice(range(n_rows), int(n_rows * training_ratio), replace=False)
+
         meta = meta[~meta.index.isin(train_indices)] if not training else meta[meta.index.isin(train_indices)]
         self.fpaths, self.texts = [], []
         ch2idx, _ = load_vocab()
@@ -47,11 +53,12 @@ class SpeechDataset(Dataset):
             mel = torch.tensor(np.load(self.fpaths[idx]))
         else:
             mel = self.mels[idx]
-        mel = mel.view(-1, args.n_mels*args.r)
+        mel = mel.view(-1, args.n_mels * args.r)
         return text, mel
 
     def __len__(self):
         return len(self.fpaths)
+
 
 def load_vocab():
     """
@@ -65,6 +72,7 @@ def load_vocab():
     char2idx = {char: idx for idx, char in enumerate(args.vocab)}
     idx2char = {idx: char for idx, char in enumerate(args.vocab)}
     return char2idx, idx2char
+
 
 def text_normalize(text):
     """
@@ -83,11 +91,13 @@ def text_normalize(text):
     text = re.sub("[ ]+", " ", text)
     return text
 
+
 def read_meta(meta_path):
     # Parse
     meta = pd.read_table(meta_path, sep='|', header=None)
     meta.columns = ['fpath', 'ori', 'expanded', 'decomposed', 'duration', 'en']
     return meta
+
 
 def collate_fn(data):
     """
@@ -120,8 +130,9 @@ def collate_fn(data):
         text_pads[idx, :text_end] = texts[idx]
         mel_end = mel_lengths[idx]
         mel_pads[idx, :mel_end] = mels[idx]
-        ff_pads[idx, mel_end-1:] = 1.0
+        ff_pads[idx, mel_end - 1:] = 1.0
     return text_pads, mel_pads, ff_pads
+
 
 class TextDataset(Dataset):
     """
@@ -131,6 +142,7 @@ class TextDataset(Dataset):
     :param ref_path: String. {<ref_path>, 'seen', 'unseen'}
 
     """
+
     def __init__(self, text_path, ref_path=None):
         self.texts = read_hangul(text_path)
 
@@ -140,6 +152,7 @@ class TextDataset(Dataset):
 
     def __len__(self):
         return len(self.texts)
+
 
 def read_text(path):
     """
@@ -160,6 +173,7 @@ def read_text(path):
         texts.append(text)
     return texts
 
+
 def read_hangul(path):
     """
     If we use pandas instead of this function, it may not cover quotes.
@@ -179,6 +193,7 @@ def read_hangul(path):
         texts.append(t)
     return texts
 
+
 def load_ref(path):
     """
     Load reference audios
@@ -195,6 +210,7 @@ def load_ref(path):
         mel, _ = utils.load_spectrogram(fpath)
         refs.append(mel)
     return refs
+
 
 def synth_collate_fn(data):
     """
@@ -224,6 +240,7 @@ def synth_collate_fn(data):
         mel_pads[idx, :mel_end] = mels[idx]
     spks = torch.stack(spks, 0).squeeze(1) if spks is not None else None
     return text_pads, mel_pads, None, spks
+
 
 def text_collate_fn(data):
     """

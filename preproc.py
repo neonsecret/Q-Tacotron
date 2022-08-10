@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
+import os
+from multiprocessing import Pool
+
+import numpy as np
+from tqdm import tqdm
+
+import data
 from config import ConfigArgs as args
 from utils import load_spectrogram
-import os, sys
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from multiprocessing import Pool
-import codecs
-import data
 
 NUM_JOBS = 8
+
 
 def f(fpath):
     """
     Loads spectrograms from file paths and save as numpy
 
-    :param f_args: spectrogram file paths and texts
+    :param fpath: spectrogram file paths and texts
     """
     mel, mag = load_spectrogram(os.path.join(args.data_path, 'wavs', fpath))
     fname = os.path.basename(fpath).replace('wav', 'npy')
@@ -23,7 +24,8 @@ def f(fpath):
     # np.save(os.path.join(args.data_path, args.mag_dir, fpath), mag)
     return None
 
-def prepro(seed):
+
+def preprocess():
     """
     Preprocess meta data and splits them for train and test set
     """
@@ -45,6 +47,6 @@ def prepro(seed):
             pbar.update()
     print('Complete')
 
+
 if __name__ == '__main__':
-    seed = 0
-    prepro(seed)
+    preprocess()
