@@ -3,7 +3,7 @@ from transformers import AutoModel
 from config import ConfigArgs as args
 import torch
 import torch.nn as nn
-from network import TextEncoder, ReferenceEncoder, StyleTokenLayer, AudioDecoder, AttentionLayer
+from network import TextEncoder, StyleTokenLayer, AudioDecoder, AttentionLayer
 import module as mm
 
 
@@ -24,7 +24,7 @@ class QTacotron(nn.Module):
     def __init__(self):
         super(QTacotron, self).__init__()
         self.name = 'QTacotron'
-        self.embed = nn.Embedding(len(args.vocab), args.Ce, padding_idx=0)
+        self.embed = nn.Embedding(119547, args.Ce, padding_idx=0)  # len(tokenizer)
         self.encoder = TextEncoder(hidden_dims=args.Cx)  # bidirectional
         self.GST = StyleTokenLayer(embed_size=args.Cx, n_units=args.Cx)
         self.tpnet = TPSENet(text_dims=args.Cx * 2, style_dims=args.Cx)

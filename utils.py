@@ -25,7 +25,7 @@ def load_spectrogram(fpath):
     wav, sr = librosa.load(fpath, sr=args.sr)
 
     wav = wav / np.abs(wav).max() * 0.999
-    ## Pre-processing
+    # Pre-processing
     wav, _ = librosa.effects.trim(wav)
     # STFT
     linear = librosa.stft(y=wav,
@@ -37,7 +37,7 @@ def load_spectrogram(fpath):
     mag = np.abs(linear)  # (1+n_fft//2, T)
 
     # mel spectrogram
-    mel_basis = librosa.filters.mel(args.sr, args.n_fft, args.n_mels)  # (n_mels, 1+n_fft//2)
+    mel_basis = librosa.filters.mel(sr=args.sr, n_fft=args.n_fft, n_mels=args.n_mels)  # (n_mels, 1+n_fft//2)
     mel = np.dot(mel_basis, mag)  # (n_mels, t)
 
     mel = np.log(np.clip(mel, 1e-5, 1e+5))
