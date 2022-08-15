@@ -1,279 +1,289 @@
-import glob
-import os
-import random
-import sys
+from datetime import datetime
+from functools import partial
+from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.parallel
-import torch.optim
-from tensorboardX import SummaryWriter
-from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
+from adabelief_pytorch import AdaBelief
+from dllogger import StdOutBackend, JSONStreamBackend, Verbosity, Logger
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from config import ConfigArgs as args
-from data import SpeechDataset, collate_fn
-from model import QTacotron
-from utils import att2img, plot_att, lr_policy
+from synthesizer.models.tacotron import audio
+from synthesizer.models.tacotron.synthesizer_dataset import SynthesizerDataset, \
+    collate_synthesizer
+from synthesizer.models.qtacotron.model import QTacotron
+from synthesizer.utils import ValueWindow
+from synthesizer.utils.plot import plot_spectrogram
+from synthesizer.utils.symbols import symbols
+from synthesizer.utils.text import sequence_to_text
+from vocoder.display import *
+import warnings
+# ah yes, the speed up
+torch.autograd.set_detect_anomaly(False)
+torch.autograd.profiler.profile(False)
+torch.autograd.profiler.emit_nvtx(False)
+torch.backends.cudnn.benchmark = False
+warnings.filterwarnings("ignore", category=UserWarning)
 
-
-# torch.autograd.set_detect_anomaly = True
-
-def train(model, data_loader, valid_loader, optimizer, scheduler, batch_size=32, ckpt_dir=None, writer=None,
-          DEVICE=None):
-    """
-    train function
-
-    :param model: nn module object
-    :param data_loader: data loader for training set
-    :param valid_loader: data loader for validation set
-    :param optimizer: optimizer
-    :param scheduler: for scheduling learning rate
-    :param batch_size: Scalar
-    :param ckpt_dir: String. checkpoint directory
-    :param writer: Tensorboard writer
-    :param DEVICE: 'cpu' or 'gpu'
-
-    """
-    epochs = 0
-    global_step = args.global_step
-    criterion = nn.L1Loss()  # default average
-    bce_loss = nn.BCELoss()
-    xe_loss = nn.CrossEntropyLoss()
-
-    GO_frames = torch.zeros([batch_size, 1, args.n_mels * args.r]).to(DEVICE)  # (N, Ty/r, n_mels)
-    idx2char = load_vocab()[-1]
-    while global_step < args.max_step:
-        epoch_loss_mel, epoch_loss_fmel, epoch_loss_ff = 0., 0., 0.
-        for step, (texts, mels, ff) in tqdm(enumerate(data_loader), total=len(data_loader), unit='B', ncols=70,
-                                            leave=False):
-            optimizer.zero_grad()
-            texts, mels, ff = texts.to(DEVICE), mels.to(DEVICE), ff.to(DEVICE)
-            prev_mels = torch.cat((GO_frames, mels[:, :-1, :]), 1)
-            refs = mels.view(mels.size(0), -1, args.n_mels).unsqueeze(1)  # (N, 1, Ty, n_mels)
-            if type(model).__name__ == 'TPGST':
-                mels_hat, fmels_hat, A, style_attentions, ff_hat, se, tpse = model(texts, prev_mels, refs)
-                loss_se = criterion(tpse, se.detach())
-            else:
-                mels_hat, fmels_hat, A, ff_hat = model(texts, prev_mels)
-
-            loss_mel = criterion(mels_hat, mels)
-            fmels = mels.view(mels.size(0), -1, args.n_mels)
-            loss_fmel = criterion(fmels_hat, fmels)
-            loss_ff = bce_loss(ff_hat, ff)
-
-            if global_step > args.tp_start and type(model).__name__ == 'TPGST':
-                loss = loss_mel + 0.01 * loss_ff + 0.01 * loss_se
-            else:
-                loss = loss_mel + 0.01 * loss_ff
-
-            loss.backward()
-            # nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-            optimizer.step()
-            scheduler.step()
-
-            epoch_loss_mel += loss_mel.item()
-            epoch_loss_fmel += loss_fmel.item()
-            epoch_loss_ff += loss_ff.item()
-
-            if global_step % args.log_term == 0:
-                writer.add_scalar('batch/loss_mel', loss_mel.item(), global_step)
-                if type(model).__name__ == 'TPGST':
-                    writer.add_scalar('batch/loss_se', loss_se.item(), global_step)
-                writer.add_scalar('batch/loss_ff', loss_ff.item(), global_step)
-                writer.add_scalar('train/lr', scheduler.get_lr()[0], global_step)
-
-            if global_step % args.eval_term == 0:
-                model.eval()  #
-                val_loss = evaluate(model, valid_loader, criterion, writer, global_step, DEVICE=DEVICE)
-                model.train()
-
-            if global_step % args.save_term == 0:
-                save_model(model, optimizer, scheduler, val_loss, global_step, ckpt_dir)  # save best 5 models
-            global_step += 1
-
-        if args.log_mode:
-            # Summary
-            avg_loss_mel = epoch_loss_mel / (len(data_loader))
-            avg_loss_fmel = epoch_loss_fmel / (len(data_loader))
-            avg_loss_ff = epoch_loss_ff / (len(data_loader))
-
-            writer.add_scalar('train/loss_mel', avg_loss_mel, global_step)
-            writer.add_scalar('train/loss_fmel', avg_loss_fmel, global_step)
-            writer.add_scalar('train/loss_ff', avg_loss_ff, global_step)
-            writer.add_scalar('train/lr', scheduler.get_lr()[0], global_step)
-
-            alignment = A[0:1].clone().cpu().detach().numpy()
-            writer.add_image('train/alignments', att2img(alignment), global_step)  # (Tx, Ty)
-            text = texts[0].cpu().detach().numpy()
-            text = [idx2char[ch] for ch in text]
-            plot_att(alignment[0], text, global_step,
-                     path=os.path.join(args.logdir, type(model).__name__, 'A', 'train'))
-
-            mel_hat = mels_hat[0:1].transpose(1, 2)
-            fmel_hat = fmels_hat[0:1].transpose(1, 2)
-            mel = mels[0:1].transpose(1, 2)
-            writer.add_image('train/mel_hat', mel_hat, global_step)
-            writer.add_image('train/fmel_hat', fmel_hat, global_step)
-            writer.add_image('train/mel', mel, global_step)
-
-            if type(model).__name__ == 'TPGST':
-                styleA = style_attentions.unsqueeze(0) * 255.
-                writer.add_image('train/styleA', styleA, global_step)
-            # print('Training Loss: {}'.format(avg_loss))
-        epochs += 1
-    print('Training complete')
+dl_logger = Logger(backends=[JSONStreamBackend(Verbosity.DEFAULT, 'log.txt'),
+                             StdOutBackend(Verbosity.VERBOSE)])
 
 
-def evaluate(model, data_loader, criterion, writer, global_step, DEVICE=None):
-    """
-    To evaluate with validation set
-
-    :param model: nn module object
-    :param data_loader: data loader
-    :param criterion: criterion for spectorgrams
-    :param writer: Tensorboard writer
-    :param global_step: Scalar. global step
-    :param DEVICE: 'cpu' or 'gpu'
-
-    """
-    bce_loss = nn.BCELoss()
-    xe_loss = nn.CrossEntropyLoss()
-    valid_loss_mel, valid_loss_fmel, valid_loss_ff, valid_loss_se = 0., 0., 0., 0.
-    A = None
-    with torch.no_grad():
-        for step, (texts, mels, ff) in enumerate(data_loader):
-            texts, mels, ff = texts.to(DEVICE), mels.to(DEVICE), ff.to(DEVICE)
-            GO_frames = torch.zeros([mels.shape[0], 1, args.n_mels * args.r]).to(DEVICE)  # (N, Ty/r, n_mels)
-            prev_mels = torch.cat((GO_frames, mels[:, :-1, :]), 1)
-            refs = mels.view(mels.size(0), -1, args.n_mels).unsqueeze(1)  # (N, 1, Ty, n_mels)
-            if type(model).__name__ == 'TPGST':
-                mels_hat, fmels_hat, A, style_attentions, ff_hat, se, tpse = model(texts, prev_mels, refs)
-                loss_se = criterion(tpse, se)
-                valid_loss_se += loss_se.item()
-            else:
-                mels_hat, fmels_hat, A, ff_hat = model(texts, prev_mels)
-
-            loss_mel = criterion(mels_hat, mels)
-            fmels = mels.view(mels.size(0), -1, args.n_mels)
-            loss_fmel = criterion(fmels_hat, fmels)
-            loss_ff = bce_loss(ff_hat, ff)
-
-            valid_loss_mel += loss_mel.item()
-            valid_loss_fmel += loss_fmel.item()
-            valid_loss_ff += loss_ff.item()
-        avg_loss_mel = valid_loss_mel / (len(data_loader))
-        avg_loss_fmel = valid_loss_fmel / (len(data_loader))
-        avg_loss_ff = valid_loss_ff / (len(data_loader))
-
-        writer.add_scalar('eval/loss_mel', avg_loss_mel, global_step)
-        writer.add_scalar('eval/loss_fmel', avg_loss_fmel, global_step)
-        writer.add_scalar('eval/loss_ff', avg_loss_ff, global_step)
-
-        alignment = A[0:1].clone().cpu().detach().numpy()
-        writer.add_image('eval/alignments', att2img(alignment), global_step)  # (Tx, Ty)
-        text = texts[0].cpu().detach().numpy()
-        text = [load_vocab()[-1][ch] for ch in text]
-        plot_att(alignment[0], text, global_step, path=os.path.join(args.logdir, type(model).__name__, 'A'))
-
-        mel_hat = mels_hat[0:1].transpose(1, 2)
-        fmel_hat = fmels_hat[0:1].transpose(1, 2)
-        mel = mels[0:1].transpose(1, 2)
-
-        writer.add_image('eval/mel_hat', mel_hat, global_step)
-        writer.add_image('eval/fmel_hat', fmel_hat, global_step)
-        writer.add_image('eval/mel', mel, global_step)
-        if type(model).__name__ == 'TPGST':
-            avg_loss_se = valid_loss_se / (len(data_loader))
-            writer.add_scalar('eval/loss_se', avg_loss_se, global_step)
-            styleA = style_attentions.view(1, mels.size(0), args.n_tokens) * 255.
-            writer.add_image('eval/styleA', styleA, global_step)
-
-    return avg_loss_mel
+def np_now(x: torch.Tensor): return x.detach().cpu().numpy()
 
 
-def save_model(model, optimizer, scheduler, val_loss, global_step, ckpt_dir):
-    """
-    To save best models
-
-    :param model: nn module object
-    :param model_infos: top 5 models which have best losses [('step', loss)]*5
-    :param optimizer: optimizer
-    :param scheduler: for learning rate update
-    :param val_loss: Scalar. validation loss
-    :param global_step: Scalar.
-    :param ckpt_dir: String. checkpoint directory
-
-    Returns:
-        model_infos: top 5 models
-    
-    """
-    cur_ckpt = 'model-{:03d}k.pth.tar'.format(global_step // 1000)
-    state = {
-        'global_step': global_step,
-        'name': type(model).__name__,
-        'model': model.state_dict(),
-        'loss': val_loss,
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-    }
-    torch.save(state, os.path.join(ckpt_dir, cur_ckpt))
+def time_string():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def main(DEVICE):
-    """
-    main function
+class Struct:
+    def __init__(self, **entries):
+        self.__dict__.update(entries)
 
-    :param DEVICE: 'cpu' or 'gpu'
 
-    """
-    model = QTacotron().to(DEVICE)
+def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_every: int, force_restart: bool,
+          hparams, use_amp, multi_gpu, print_every, batch_size, gradinit_bsize,
+          n_epoch, perf_limit, debug=False, **args):
+    if debug:
+        start_time = time.time()
+        use_time = time.time()
+    models_dir.mkdir(exist_ok=True)
+    torch.cuda.empty_cache()
+    model_dir = models_dir.joinpath(run_id)
+    plot_dir = model_dir.joinpath("plots")
+    wav_dir = model_dir.joinpath("wavs")
+    mel_output_dir = model_dir.joinpath("mel-spectrograms")
+    meta_folder = model_dir.joinpath("metas")
+    model_dir.mkdir(exist_ok=True)
+    plot_dir.mkdir(exist_ok=True)
+    wav_dir.mkdir(exist_ok=True)
+    mel_output_dir.mkdir(exist_ok=True)
+    meta_folder.mkdir(exist_ok=True)
 
-    print('Model {} is working...'.format(type(model).__name__))
-    ckpt_dir = os.path.join(args.logdir, type(model).__name__)
+    weights_fpath = model_dir / f"synthesizer.pt"
+    metadata_fpath = syn_dir.joinpath("train.txt")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = LambdaLR(optimizer, lr_policy)
+    print("Checkpoint path: {}".format(weights_fpath))
+    print("Loading training data from: {}".format(metadata_fpath))
+    print("Using model: Tacotron")
+    if debug:
+        use_time = time.time()
+        print("Init time: {}, elapsed: {}, point 1".format(use_time, time.time() - start_time))
 
-    if not os.path.exists(ckpt_dir):
-        os.makedirs(os.path.join(ckpt_dir, 'A', 'train'))
+    time_window = ValueWindow(100)
+    loss_window = ValueWindow(100)
+
+    if torch.cuda.is_available() or True:
+        dev_index = 0  # useful for multigpu
+        device = torch.device(dev_index)
+        from torch.cuda.amp import autocast
+        if torch.cuda.device_count() > 1 and multi_gpu:
+            print("Using devices:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+        else:
+            print("Using device:", torch.cuda.get_device_name(dev_index))
     else:
-        print('Already exists. Retrain the model.')
-        model_path = sorted(glob.glob(os.path.join(ckpt_dir, 'model-*.tar')))[-1]  # latest model
-        state = torch.load(model_path)
-        model.load_state_dict(state['model'])
-        args.global_step = state['global_step']
-        optimizer.load_state_dict(state['optimizer'])
-        scheduler.last_epoch = state['scheduler']['last_epoch']
-        scheduler.base_lrs = state['scheduler']['base_lrs']
+        device = torch.device("cpu")
+        from torch.cpu.amp import autocast
+        print("Using device:", device)
 
-    dataset = SpeechDataset(args.data_path, args.meta, mem_mode=args.mem_mode, training=True)
-    validset = SpeechDataset(args.data_path, args.meta, mem_mode=args.mem_mode, training=False)
-    data_loader = DataLoader(dataset=dataset, batch_size=args.batch_size,
-                             shuffle=True, collate_fn=collate_fn,
-                             drop_last=True, pin_memory=True, num_workers=args.n_workers)
-    valid_loader = DataLoader(dataset=validset, batch_size=args.test_batch,
-                              shuffle=False, collate_fn=collate_fn, pin_memory=True)
-    # torch.set_num_threads(4)
-    print('{} threads are used...'.format(torch.get_num_threads()))
+    print("\nInitialising Tacotron Tweaked Model...\n")
+    model = QTacotron().to(device)
 
-    writer = SummaryWriter(ckpt_dir)
-    train(model, data_loader, valid_loader, optimizer, scheduler,
-          batch_size=args.batch_size, ckpt_dir=ckpt_dir, writer=writer, DEVICE=DEVICE)
-    return None
+    # Initialize the dataset
+    metadata_fpath = syn_dir.joinpath("train.txt")
+    mel_dir = syn_dir.joinpath("mels")
+    embed_dir = syn_dir.joinpath("embeds")
+    dataset = SynthesizerDataset(metadata_fpath, mel_dir, embed_dir, hparams)
+
+    gradinit_bsize = int(batch_size / 2) if gradinit_bsize < 0 else int(gradinit_bsize / 2)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    optimizer = AdaBelief(model.parameters(), lr=5e-4, eps=1e-16, betas=(0.9, 0.999), weight_decouple=True,
+                          rectify=True)
+    if force_restart or not weights_fpath.exists():
+        print("\nStarting the training of Tacotron from scratch\n")
+        model.save(weights_fpath, optimizer)
+
+        # Embeddings metadata
+        char_embedding_fpath = meta_folder.joinpath("CharacterEmbeddings.tsv")
+        with open(char_embedding_fpath, "w", encoding="utf-8") as f:
+            for symbol in symbols:
+                if symbol == " ":
+                    symbol = "\\s"  # For visual purposes, swap space with \s
+
+                f.write("{}\n".format(symbol))
+
+    else:
+        print("\nLoading weights at %s" % weights_fpath)
+        model.load(weights_fpath, optimizer)
+        print("Tacotron weights loaded from step %d" % model.step)
+    r, lr, max_step, batch_size = hparams.tts_schedule_dict[hparams.get_max(model.step)]
+    if force_restart or not weights_fpath.exists():
+        model.save(weights_fpath, optimizer)
+    else:
+        model.load(weights_fpath, optimizer)
+
+    current_step = model.get_step()
+
+    training_steps = max_step - current_step
+    collate_fn = partial(collate_synthesizer, r=r, hparams=hparams)
+    # Begin the training
+    simple_table([(f"Steps with r={r}", str(training_steps // 1000) + "k Steps"),
+                  ("Batch Size", batch_size),
+                  ("Learning Rate", lr),
+                  ("Outputs/Step (r)", model.r)])
+
+    data_loader = DataLoader(dataset, batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn,
+                             pin_memory=True, timeout=300)
+
+    total_iters = len(dataset)
+    steps_per_epoch = np.ceil(total_iters / batch_size).astype(np.int32)
+    epochs = np.ceil(training_steps / steps_per_epoch).astype(np.int32)
+    dt_len = len(data_loader)
+    print("Printing every", print_every, "steps")
+    while True:
+        r, lr, max_step, batch_size = hparams.tts_schedule_dict[hparams.get_max(model.step)]
+        model.r = r
+        try:
+            for epoch in range(1, epochs + 1):
+                for i, (texts, mels, embeds, idx) in enumerate(data_loader, 1):
+                    if perf_limit and i >= 500:  # for testing the dataset, 500 will be enough
+                        break
+
+                    start_time = time.time()
+                    # Generate stop tokens for training
+                    stop = torch.ones(mels.shape[0], mels.shape[2], device=device)
+                    for j, k in enumerate(idx):
+                        stop[j, :int(len(mels[j])) - 1] = 0
+
+                    # switch to gpu
+                    texts = texts.to(device)
+                    mels = mels.to(device)
+                    embeds = embeds.to(device)
+
+                    use_amp = bool(use_amp)
+
+                    with autocast(enabled=use_amp):
+                        # forward pass
+                        m1_hat, m2_hat, attention, stop_pred = model(texts, mels, embeds)
+
+                    m1_loss = F.mse_loss(m1_hat, mels) + F.l1_loss(m1_hat, mels)
+                    m2_loss = F.mse_loss(m2_hat, mels)
+                    stop_loss = F.binary_cross_entropy(stop_pred, stop)
+
+                    loss = m1_loss + m2_loss + stop_loss
+
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+
+                    if hparams.tts_clip_grad_norm is not None:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.tts_clip_grad_norm)
+                        if np.isnan(grad_norm.cpu()):
+                            print("grad_norm was NaN!")
+
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    time_window.append(time.time() - start_time)
+                    loss_window.append(loss.item())
+
+                    step = model.get_step()
+                    k = step // 1000
+
+                    msg = {
+                        "Loss": f"{loss_window.average:#.4}",
+                        "steps/s": f"{1. / time_window.average:#.2}",
+                        "Step": step,
+                        "One step time": str(round(time.time() - start_time, 2)) + "s"
+                    }
+                    if i % print_every == 0:
+                        dl_logger.log(step=(epoch, str(i) + "/" + str(dt_len)), data=msg)
+                    # Backup or save model as appropriate
+                    if backup_every != 0 and step % backup_every == 0:
+                        backup_fpath = weights_fpath.parent / f"synthesizer_{k:06d}.pt"
+                        model.save(backup_fpath, optimizer)
+
+                    if save_every != 0 and step % save_every == 0:
+                        model.save(weights_fpath, optimizer)
+                        dl_logger.log("INFO", data={
+                            "status": "saved.."
+                        })
+                        dl_logger.flush()
+
+                    # Evaluate model to generate samples
+                    epoch_eval = hparams.tts_eval_interval == -1 and i == steps_per_epoch  # If epoch is done
+                    step_eval = hparams.tts_eval_interval > 0 and step % hparams.tts_eval_interval == 0  # Every N steps
+                    if epoch_eval or step_eval:
+                        for sample_idx in range(hparams.tts_eval_num_samples):
+                            # At most, generate samples equal to number in the batch
+                            if sample_idx + 1 <= len(texts):
+                                # Remove padding from mels using frame length in metadata
+                                mel_length = int(dataset.metadata[idx[sample_idx]][4])
+                                mel_prediction = np_now(m2_hat[sample_idx]).T[:mel_length]
+                                target_spectrogram = np_now(mels[sample_idx]).T[:mel_length]
+                                attention_len = mel_length // model.r
+
+                                eval_model(attention=np_now(attention[sample_idx][:, :attention_len]),
+                                           mel_prediction=mel_prediction,
+                                           target_spectrogram=target_spectrogram,
+                                           input_seq=np_now(texts[sample_idx]),
+                                           step=step,
+                                           plot_dir=plot_dir,
+                                           mel_output_dir=mel_output_dir,
+                                           wav_dir=wav_dir,
+                                           sample_num=sample_idx + 1,
+                                           loss=loss,
+                                           hparams=hparams)
+
+                    # Break out of loop to update training schedule
+                    if step >= max_step:
+                        break
+        except:
+            pass
 
 
-if __name__ == '__main__':
-    gpu_id = int(sys.argv[1])
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "{}".format(gpu_id)
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Set random seem for reproducibility
-    seed = 999
-    print("Random Seed: ", seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    main(DEVICE)
+def test(model, device, data_loader, dataset):
+    losses = []
+    for i, (texts, mels, embeds, idx) in enumerate(data_loader, 1):
+        if i == 5:
+            break
+        stop = torch.ones(mels.shape[0], mels.shape[2], device=device)
+        mels = mels.to(device)
+        for j, k in enumerate(idx):
+            stop[j, :int(dataset.metadata[k][4]) - 1] = 0
+        with torch.no_grad():
+            m1_hat, m2_hat, attention, stop_pred = model(texts.to(device), mels, embeds.to(device))
+        m1_loss = F.mse_loss(m1_hat, mels) + F.l1_loss(m1_hat, mels)
+        m2_loss = F.mse_loss(m2_hat, mels)
+        stop_loss = F.binary_cross_entropy(stop_pred, stop)  # ?
+
+        losses.append(float(m1_loss + m2_loss + stop_loss))
+    return round(1 - avg(losses), 2)
+
+
+def avg(x):
+    return sum(x) / len(x)
+
+
+def eval_model(attention, mel_prediction, target_spectrogram, input_seq, step,
+               plot_dir, mel_output_dir, wav_dir, sample_num, loss, hparams):
+    # Save some results for evaluation
+    attention_path = str(plot_dir.joinpath("attention_step_{}_sample_{}".format(step, sample_num)))
+    save_attention(attention, attention_path)
+
+    # save predicted mel spectrogram to disk (debug)
+    mel_output_fpath = mel_output_dir.joinpath("mel-prediction-step-{}_sample_{}.npy".format(step, sample_num))
+    np.save(str(mel_output_fpath), mel_prediction, allow_pickle=False)
+
+    # save griffin lim inverted wav for debug (mel -> wav)
+    wav = audio.inv_mel_spectrogram(mel_prediction.T, hparams)
+    wav_fpath = wav_dir.joinpath("step-{}-wave-from-mel_sample_{}.wav".format(step, sample_num))
+    audio.save_wav(wav, str(wav_fpath), sr=hparams.sample_rate)
+
+    # save real and predicted mel-spectrogram plot to disk (control purposes)
+    spec_fpath = plot_dir.joinpath("step-{}-mel-spectrogram_sample_{}.png".format(step, sample_num))
+    title_str = "{}, {}, step={}, loss={:.5f}".format("Tacotron", time_string(), step, loss)
+    plot_spectrogram(mel_prediction, str(spec_fpath), title=title_str,
+                     target_spectrogram=target_spectrogram,
+                     max_len=target_spectrogram.size // hparams.num_mels)
+    print("\nInput at step {}: {}".format(step, sequence_to_text(input_seq)))

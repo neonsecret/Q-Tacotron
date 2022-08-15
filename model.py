@@ -1,3 +1,4 @@
+import numpy as np
 from transformers import AutoModel
 
 from config import ConfigArgs as args
@@ -52,7 +53,12 @@ class QTacotron(nn.Module):
             :style_emb: (N, 1, E) Tensor. Style embedding
         """
         if refs is None:
-            refs = torch.randn_like(prev_mels)
+            mel_lengths = [len(mel) for mel in prev_mels]
+            refs = torch.zeros(len(prev_mels), max(mel_lengths), 1)
+            for idx in range(len(prev_mels)):
+                mel_end = mel_lengths[idx]
+                refs[idx, mel_end - 1:] = 1.0
+
         x = self.embed(texts)  # (bsize, Tx, Ce)
         text_emb, enc_hidden = self.encoder(x)  # (bsize, Tx, Cx*2)
         tp_style_emb = self.tpnet(text_emb)
@@ -71,6 +77,36 @@ class QTacotron(nn.Module):
         memory = torch.cat([text_emb, tiled_style_emb], dim=-1)  # (N, Tx, Cx*2+E)
         mels_hat, mags_hat, attentions, ff_hat = self.decoder(prev_mels, memory, synth=synth)
         return mels_hat, mags_hat, attentions, style_attentions, ff_hat, style_emb, tp_style_emb
+
+    def save(self, path, optimizer=None):
+        if optimizer is not None:
+            torch.save({
+                "model_state": self.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }, str(path))
+        else:
+            torch.save({
+                "model_state": self.state_dict(),
+            }, str(path))
+
+    def init_model(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def get_step(self):
+        return self.step.data.item()
+
+    def reset_step(self):
+        # assignment to parameters or buffers is overloaded, updates internal dict entry
+        self.step = self.step.data.new_tensor(1)
+
+    def num_params(self, print_out=True):
+        parameters = filter(lambda p: p.requires_grad, self.parameters())
+        parameters = sum([np.prod(p.size()) for p in parameters]) / 1_000_000
+        if print_out:
+            print("Trainable Parameters: %.3fM" % parameters)
+        return parameters
 
 
 class TPSENet(nn.Module):
