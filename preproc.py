@@ -49,4 +49,4 @@ def preprocess():
 
 
 if __name__ == '__main__':
-    preprocess()
+    preprocess()  # "should produce .mp3.npy files in a "_npy" folder

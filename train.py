@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import ConfigArgs as args
-from data import SpeechDataset, collate_fn, load_vocab
+from data import SpeechDataset, collate_fn
 from model import QTacotron
 from utils import att2img, plot_att, lr_policy
 
@@ -30,7 +30,7 @@ def train(model, data_loader, valid_loader, optimizer, scheduler, batch_size=32,
     :param data_loader: data loader for training set
     :param valid_loader: data loader for validation set
     :param optimizer: optimizer
-    :param scheculer: for scheduling learning rate
+    :param scheduler: for scheduling learning rate
     :param batch_size: Scalar
     :param ckpt_dir: String. checkpoint directory
     :param writer: Tensorboard writer

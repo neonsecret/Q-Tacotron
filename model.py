@@ -32,6 +32,7 @@ class QTacotron(nn.Module):
         self.attention = AttentionLayer(embed_size=args.Cx, n_units=args.Cx)
 
         self.Bert = AutoModel.from_pretrained("DeepPavlov/rubert-base-cased").eval()
+        self.bert_linear = nn.Linear(768, args.Cx)
         self.WordLabelsPredictor = Empty()  # find later
 
     def forward(self, texts, prev_mels, refs=None, synth=False, ref_mode=True):
@@ -50,15 +51,18 @@ class QTacotron(nn.Module):
             :ff_hat: (N, Ty/r, 1) Tensor for binary final prediction
             :style_emb: (N, 1, E) Tensor. Style embedding
         """
-        x = self.embed(texts)  # (N, Tx, Ce)
-        text_emb, enc_hidden = self.encoder(x)  # (N, Tx, Cx*2)
+        if refs is None:
+            refs = torch.randn_like(prev_mels)
+        x = self.embed(texts)  # (bsize, Tx, Ce)
+        text_emb, enc_hidden = self.encoder(x)  # (bsize, Tx, Cx*2)
         tp_style_emb = self.tpnet(text_emb)
-        bert_embeds = self.Bert(texts)
-        replicated_embeds = self.WordLabelsPredictor(bert_embeds + text_emb)
+        bert_embeds = self.bert_linear(self.Bert(texts)["pooler_output"]).unsqueeze(1).repeat((1, args.n_tokens, 1))
+        # replicated_embeds = self.WordLabelsPredictor(bert_embeds + text_emb)
+        replicated_embeds = 0
         if synth:
             style_emb, style_attentions = tp_style_emb + bert_embeds + replicated_embeds, None
         else:
-            token_embedding = self.GST(refs, ref_mode=ref_mode)  # (N, 1, E), (N, n_tokens)
+            token_embedding = self.GST(refs)  # (N, 1, E), (N, n_tokens)
             token_embedding = token_embedding + replicated_embeds
 
             style_emb, style_attentions = self.attention(token_embedding + bert_embeds, refs)
