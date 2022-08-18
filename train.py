@@ -9,7 +9,7 @@ from dllogger import StdOutBackend, JSONStreamBackend, Verbosity, Logger
 from torch.utils.data import DataLoader
 
 from synthesizer.models.tacotron import audio
-from synthesizer.models.tacotron.synthesizer_dataset import SynthesizerDataset, \
+from synthesizer.models.qtacotron.synthesizer_dataset import SynthesizerDataset, \
     collate_synthesizer
 from synthesizer.models.qtacotron.model import QTacotron
 from synthesizer.utils import ValueWindow
@@ -65,7 +65,7 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
 
     print("Checkpoint path: {}".format(weights_fpath))
     print("Loading training data from: {}".format(metadata_fpath))
-    print("Using model: Tacotron")
+    print("Using model: QTacotron")
     if debug:
         use_time = time.time()
         print("Init time: {}, elapsed: {}, point 1".format(use_time, time.time() - start_time))
@@ -86,7 +86,7 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
         from torch.cpu.amp import autocast
         print("Using device:", device)
 
-    print("\nInitialising Tacotron Tweaked Model...\n")
+    print("\nInitialising QTacotron Model...\n")
     model = QTacotron().to(device)
 
     # Initialize the dataset
@@ -100,7 +100,8 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
     optimizer = AdaBelief(model.parameters(), lr=5e-4, eps=1e-16, betas=(0.9, 0.999), weight_decouple=True,
                           rectify=True)
     if force_restart or not weights_fpath.exists():
-        print("\nStarting the training of Tacotron from scratch\n")
+        print("\nStarting the training of QTacotron from scratch\n")
+        model.step = torch.tensor(0)
         model.save(weights_fpath, optimizer)
 
         # Embeddings metadata
@@ -129,12 +130,11 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
     # Begin the training
     simple_table([(f"Steps with r={r}", str(training_steps // 1000) + "k Steps"),
                   ("Batch Size", batch_size),
-                  ("Learning Rate", lr),
-                  ("Outputs/Step (r)", model.r)])
+                  ("Learning Rate", lr)])
 
-    data_loader = DataLoader(dataset, batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn,
+    data_loader = DataLoader(dataset, batch_size, shuffle=True, num_workers=2, collate_fn=collate_fn,
                              pin_memory=True, timeout=300)
-
+    torch.save(data_loader, "data_loader")
     total_iters = len(dataset)
     steps_per_epoch = np.ceil(total_iters / batch_size).astype(np.int32)
     epochs = np.ceil(training_steps / steps_per_epoch).astype(np.int32)
@@ -145,7 +145,7 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
         model.r = r
         try:
             for epoch in range(1, epochs + 1):
-                for i, (texts, mels, embeds, idx) in enumerate(data_loader, 1):
+                for i, (texts, mels, embeds, bert_embeds, idx) in enumerate(data_loader, 1):
                     if perf_limit and i >= 500:  # for testing the dataset, 500 will be enough
                         break
 
@@ -159,12 +159,13 @@ def train(run_id: str, syn_dir: Path, models_dir: Path, save_every: int, backup_
                     texts = texts.to(device)
                     mels = mels.to(device)
                     embeds = embeds.to(device)
+                    bert_embeds = bert_embeds.to(device)
 
                     use_amp = bool(use_amp)
 
                     with autocast(enabled=use_amp):
                         # forward pass
-                        m1_hat, m2_hat, attention, stop_pred = model(texts, mels, embeds)
+                        m1_hat, m2_hat, attention, stop_pred = model(texts, mels, embeds, bert_embeds)
 
                     m1_loss = F.mse_loss(m1_hat, mels) + F.l1_loss(m1_hat, mels)
                     m2_loss = F.mse_loss(m2_hat, mels)

@@ -1,10 +1,10 @@
-from config import ConfigArgs as args
+from .config import ConfigArgs as args
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 from torch.nn.utils import weight_norm as norm
 import numpy as np
-import module as mm
+from . import module as mm
 
 
 class PreNet(nn.Module):
@@ -100,7 +100,7 @@ class TextEncoder(nn.Module):
         self.prenet = PreNet(args.Ce, hidden_dims)
         self.cbhg = CBHG(input_dim=hidden_dims, hidden_dim=hidden_dims, K=16, n_highway=4, bidirectional=True)
 
-    def forward(self, x):
+    def forward(self, x, speaker_embedding):
         """
         :param x: (N, Tx, Ce) Tensor. Character embedding
 
@@ -109,9 +109,44 @@ class TextEncoder(nn.Module):
             :hidden: Tensor.
         
         """
-        y_ = self.prenet(x)  # (N, Tx, Cx)
-        y_, hidden = self.cbhg(y_)  # (N, Cx*2, Tx)
-        return y_, hidden
+        x = self.prenet(x)  # (N, Tx, Cx)
+        x, _ = self.cbhg(x)  # (N, Cx*2, Tx)
+        if speaker_embedding is not None:
+            x = self.add_speaker_embedding(x, speaker_embedding)
+        return x
+
+    def add_speaker_embedding(self, x, speaker_embedding):
+        # SV2TTS
+        # The input x is the encoder output and is a 3D tensor with size (batch_size, num_chars, tts_embed_dims)
+        # When training, speaker_embedding is also a 2D tensor with size (batch_size, speaker_embedding_size)
+        #     (for inference, speaker_embedding is a 1D tensor with size (speaker_embedding_size))
+        # This concats the speaker embedding for each char in the encoder output
+
+        # Save the dimensions as human-readable names
+        # print(x.shape)
+        # print("se: ", speaker_embedding.shape)
+        batch_size = x.size()[0]
+        num_chars = x.size()[1]
+
+        if speaker_embedding.dim() == 1:
+            idx = 0
+        else:
+            idx = 1
+
+        # Start by making a copy of each speaker embedding to match the input text length
+        # The output of this has size (batch_size, num_chars * tts_embed_dims)
+        speaker_embedding_size = speaker_embedding.size()[idx]
+        # print(speaker_embedding.shape, num_chars, idx)
+        e = speaker_embedding.repeat_interleave(num_chars, dim=idx)
+        # print(e.shape)
+        # Reshape it and transpose
+
+        e = e.reshape(batch_size, speaker_embedding_size, num_chars)
+        e = e.transpose(1, 2)
+
+        # Concatenate the tiled speaker embedding with the encoder output
+        x = torch.cat((x, e), 2)
+        return x
 
 
 class ReferenceEncoder(nn.Module):
@@ -168,14 +203,10 @@ class AttentionLayer(nn.Module):
     def __init__(self, embed_size=128, n_units=128):
         super().__init__()
         self.attention = MultiHeadAttention(n_units, embed_size)
+        self.ref_encoder = ReferenceEncoder(in_channels=1, embed_size=embed_size, activation_fn=torch.tanh)
 
-    def forward(self, token_embedding, ref, ref_mode=True):
-
-        if ref_mode:
-            ref = self.ref_encoder(ref)  # (N, 1, E)
-            A = torch.softmax(self.att(ref, token_embedding), dim=-1)  # (N, n_tokens)
-        else:
-            A = torch.softmax(ref, dim=-1)
+    def forward(self, token_embedding):
+        A = torch.softmax(self.attention(token_embedding), dim=-1)  # (N, n_tokens)
         y_ = torch.sum(A.unsqueeze(-1) * token_embedding, dim=1, keepdim=True)  # (N, 1, E)
         y_ = torch.tanh(y_)
         return y_, A
@@ -245,7 +276,7 @@ class MultiHeadAttention(nn.Module):
             nn.Tanh(),
         )
 
-    def forward(self, ref_embedding, token_embedding):
+    def forward(self, token_embedding):
         """
         :param ref_embedding: (N, 1, E) Reference embedding
         :param token_embedding: (N, n_tokens, embed_size) Token Embedding
@@ -254,7 +285,7 @@ class MultiHeadAttention(nn.Module):
             y_: (N, n_tokens) Tensor. Style attention weight
 
         """
-        Q = self.fc_Q(self.conv_Q(ref_embedding.transpose(1, 2)).transpose(1, 2))  # (N, 1, n_units)
+        Q = self.fc_Q(self.conv_Q(token_embedding.transpose(1, 2)).transpose(1, 2))  # (N, 1, n_units)
         K = self.fc_K(self.conv_K(token_embedding.transpose(1, 2)).transpose(1, 2))  # (N, n_tokens, n_units)
         V = self.fc_V(token_embedding)  # (N, n_tokens, n_units)
         Q = torch.stack(Q.split(self.split_size, dim=-1), dim=0)  # (n_heads, N, 1, n_units//n_heads)
@@ -282,7 +313,7 @@ class AudioDecoder(nn.Module):
 
     def __init__(self, enc_dim, dec_dim):
         super(AudioDecoder, self).__init__()
-        self.prenet = PreNet(args.n_mels * args.r, dec_dim)
+        self.prenet = PreNet(args.n_mels * args.r * 2, dec_dim)
         self.attention_rnn = mm.AttentionRNN(enc_dim=enc_dim, dec_dim=dec_dim)
         self.proj_att = nn.Linear(enc_dim + dec_dim, dec_dim)
         self.decoder_rnn = nn.ModuleList([
